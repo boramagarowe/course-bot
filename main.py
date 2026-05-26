@@ -1,11 +1,12 @@
 """
 📚 Course Materials Telegram Bot
-Built for Amoud University students
+Files stored on Telegram servers permanently - no local storage needed
 """
 
 import os
 import asyncio
 import logging
+import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,32 +18,62 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────────────────────
-# CONFIGURATION — edit these two lines only
+# CONFIGURATION
 # ─────────────────────────────────────────────
-BOT_TOKEN     = "8893149580:AAGv1IqqklllpgghOJTCLy7XB0BIGWyur28"   # From @BotFather
-ADMIN_IDS     = [1407379732]         # Your Telegram numeric ID
-MATERIALS_DIR = "materials"
-BOT_NAME      = "Amoud University"
+BOT_TOKEN     = os.environ.get("BOT_TOKEN", "YOUR_TOKEN_HERE")
+ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "0").split(",") if x.strip()]
+BOT_NAME      = os.environ.get("BOT_NAME", "Amoud University")
+DB_FILE       = "database.json"  # Stores course/file info (tiny file, safe on Railway)
 # ─────────────────────────────────────────────
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# ── Database (JSON file storing Telegram file_ids) ────
+
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_db(db):
+    with open(DB_FILE, "w") as f:
+        json.dump(db, f, indent=2)
+
 def get_courses():
-    os.makedirs(MATERIALS_DIR, exist_ok=True)
-    return sorted(d for d in os.listdir(MATERIALS_DIR)
-                  if os.path.isdir(os.path.join(MATERIALS_DIR, d)))
+    return sorted(load_db().keys())
 
 def get_files(course):
-    path = os.path.join(MATERIALS_DIR, course)
-    if not os.path.isdir(path):
-        return []
-    return sorted(f for f in os.listdir(path)
-                  if os.path.isfile(os.path.join(path, f)))
+    db = load_db()
+    return db.get(course, {})
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def add_file(course, filename, file_id):
+    db = load_db()
+    if course not in db:
+        db[course] = {}
+    db[course][filename] = file_id
+    save_db(db)
+
+def delete_file(course, filename):
+    db = load_db()
+    if course in db and filename in db[course]:
+        del db[course][filename]
+        if not db[course]:
+            del db[course]
+        save_db(db)
+        return True
+    return False
+
+def add_course(name):
+    db = load_db()
+    if name not in db:
+        db[name] = {}
+        save_db(db)
+
+
+# ── Keyboards ─────────────────────────────────
 
 def courses_keyboard():
     courses = get_courses()
@@ -54,12 +85,17 @@ def courses_keyboard():
 def chapters_keyboard(course):
     files = get_files(course)
     rows = []
-    for f in files:
-        label = os.path.splitext(f)[0]
-        rows.append([InlineKeyboardButton(f"📄 {label}", callback_data=f"FILE|{course}|{f}")])
+    for filename in sorted(files.keys()):
+        label = os.path.splitext(filename)[0]
+        rows.append([InlineKeyboardButton(f"📄 {label}", callback_data=f"FILE|{course}|{filename}")])
     rows.append([InlineKeyboardButton("⬅️ Back to Courses", callback_data="BACK|courses")])
     return InlineKeyboardMarkup(rows)
 
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+# ── Student Commands ──────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user.first_name
@@ -96,6 +132,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
+# ── Button Handler ────────────────────────────
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -124,19 +163,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("FILE|"):
         _, course, filename = data.split("|", 2)
-        file_path = os.path.join(MATERIALS_DIR, course, filename)
-        if not os.path.exists(file_path):
+        files = get_files(course)
+        file_id = files.get(filename)
+
+        if not file_id:
             await query.edit_message_text("❌ File not found. Contact your instructor.")
             return
+
         await query.edit_message_text(f"⏳ Sending *{filename}*…", parse_mode="Markdown")
-        with open(file_path, "rb") as f:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=f,
-                filename=filename,
-                caption=f"📘 *{course}*\n📄 {os.path.splitext(filename)[0]}",
-                parse_mode="Markdown"
-            )
+
+        await context.bot.send_document(
+            chat_id=query.message.chat_id,
+            document=file_id,
+            caption=f"📘 *{course}*\n📄 {os.path.splitext(filename)[0]}",
+            parse_mode="Markdown"
+        )
+
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text="✅ Done! Need another file?",
@@ -150,6 +192,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=courses_keyboard()
         )
 
+
+# ── Admin Commands ────────────────────────────
+
 async def cmd_addcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -157,7 +202,7 @@ async def cmd_addcourse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/addcourse Course Name`", parse_mode="Markdown")
         return
     name = " ".join(context.args)
-    os.makedirs(os.path.join(MATERIALS_DIR, name), exist_ok=True)
+    add_course(name)
     await update.message.reply_text(f"✅ Course *{name}* created!", parse_mode="Markdown")
 
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,7 +212,7 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/upload Course Name`", parse_mode="Markdown")
         return
     course = " ".join(context.args)
-    os.makedirs(os.path.join(MATERIALS_DIR, course), exist_ok=True)
+    add_course(course)
     context.user_data["upload_course"] = course
     await update.message.reply_text(
         f"📤 Ready! Send files and they'll go into *{course}*.",
@@ -185,10 +230,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     doc = update.message.document
-    course_dir = os.path.join(MATERIALS_DIR, course)
-    os.makedirs(course_dir, exist_ok=True)
-    tg_file = await doc.get_file()
-    await tg_file.download_to_drive(os.path.join(course_dir, doc.file_name))
+    # Save Telegram file_id instead of downloading the file
+    add_file(course, doc.file_name, doc.file_id)
     await update.message.reply_text(
         f"✅ *{doc.file_name}* saved to *{course}*!",
         parse_mode="Markdown"
@@ -205,7 +248,7 @@ async def cmd_listcourses(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in courses:
         files = get_files(c)
         lines.append(f"📘 *{c}* — {len(files)} file(s)")
-        for f in files:
+        for f in sorted(files.keys()):
             lines.append(f"  • {f}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -217,13 +260,13 @@ async def cmd_deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/deletefile Course | filename.pdf`", parse_mode="Markdown")
         return
     course, filename = [x.strip() for x in full.split("|", 1)]
-    path = os.path.join(MATERIALS_DIR, course, filename)
-    if os.path.exists(path):
-        os.remove(path)
+    if delete_file(course, filename):
         await update.message.reply_text(f"🗑️ Deleted *{filename}*.", parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ File not found.", parse_mode="Markdown")
 
+
+# ── Main ──────────────────────────────────────
 
 async def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -238,12 +281,12 @@ async def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    print("🤖 Bot is running! Press Ctrl+C to stop.")
+    print("🤖 Bot is running!")
 
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        await asyncio.Event().wait()  # Run forever
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
